@@ -2,6 +2,7 @@ var fs = require('fs')
 var polyfills = require('./polyfills.js')
 var legacy = require('./legacy-streams.js')
 var queue = []
+var fileQueues = {}
 
 var util = require('util')
 
@@ -53,7 +54,7 @@ fs.closeSync = (function (fs$closeSync) { return function (fd) {
 
 function patch (fs) {
   // Everything that references the open() function needs to be in here
-  polyfills(fs)
+  polyfills(fs, fileEnqueue, fileNext)
   fs.gracefulify = patch
   fs.FileReadStream = ReadStream;  // Legacy name.
   fs.FileWriteStream = WriteStream;  // Legacy name.
@@ -68,7 +69,8 @@ function patch (fs) {
     return go$readFile(path, options, cb)
 
     function go$readFile (path, options, cb) {
-      return fs$readFile(path, options, function (err) {
+      fileEnqueue(path, [fs$readFile, [path, options, function (err) {
+        fileNext(path)
         if (err && (err.code === 'EMFILE' || err.code === 'ENFILE'))
           enqueue([go$readFile, [path, options, cb]])
         else {
@@ -76,7 +78,7 @@ function patch (fs) {
             cb.apply(this, arguments)
           retry()
         }
-      })
+      }]])
     }
   }
 
@@ -89,7 +91,8 @@ function patch (fs) {
     return go$writeFile(path, data, options, cb)
 
     function go$writeFile (path, data, options, cb) {
-      return fs$writeFile(path, data, options, function (err) {
+      fileEnqueue(path, [fs$writeFile, [path, data, options, function (err) {
+        fileNext(path)
         if (err && (err.code === 'EMFILE' || err.code === 'ENFILE'))
           enqueue([go$writeFile, [path, data, options, cb]])
         else {
@@ -97,7 +100,7 @@ function patch (fs) {
             cb.apply(this, arguments)
           retry()
         }
-      })
+      }]])
     }
   }
 
@@ -111,7 +114,8 @@ function patch (fs) {
     return go$appendFile(path, data, options, cb)
 
     function go$appendFile (path, data, options, cb) {
-      return fs$appendFile(path, data, options, function (err) {
+      fileEnqueue(path, [fs$appendFile, [path, data, options, function (err) {
+        fileNext(path)
         if (err && (err.code === 'EMFILE' || err.code === 'ENFILE'))
           enqueue([go$appendFile, [path, data, options, cb]])
         else {
@@ -119,7 +123,7 @@ function patch (fs) {
             cb.apply(this, arguments)
           retry()
         }
-      })
+      }]])
     }
   }
 
@@ -246,6 +250,38 @@ function retry () {
   var elem = queue.shift()
   if (elem) {
     debug('RETRY', elem[0].name, elem[1])
+    elem[0].apply(null, elem[1])
+  }
+}
+
+function fileEnqueue (file, elem) {
+  if (process.platform !== "win32") {
+    return elem[0].apply(null, elem[1])
+  }
+
+  if (fileQueues[file]) {
+    debug('FILE ENQUEUE', file, elem[0].name, elem[1], 'QUEUED')
+    fileQueues[file].push(elem)
+  } else {
+    debug('FILE ENQUEUE', file, elem[0].name, elem[1], 'RUNNING')
+    fileQueues[file] = [elem]
+    elem[0].apply(null, elem[1])
+  }
+}
+
+function fileNext (file) {
+  if (process.platform !== "win32") {
+    return
+  }
+
+  fileQueues[file].shift()
+
+  if (fileQueues[file].length === 0) {
+    debug('FILE NEXT', file, 'DONE')
+    delete fileQueues[file]
+  } else {
+    var elem = fileQueues[file][0]
+    debug('FILE NEXT', file, elem[0].name, elem[1])
     elem[0].apply(null, elem[1])
   }
 }
